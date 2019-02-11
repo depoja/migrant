@@ -3,104 +3,125 @@ package migrant
 import (
 	"database/sql"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"path/filepath"
-	"sort"
 )
 
-const version = "0.0.1"
+var migrantVersion, metaTable = "0.0.1", "migration_meta"
 
 // Migrant is the migration helper definition
 type Migrant struct {
-	db *sql.DB
+	db  *sql.DB
+	tx  *sql.Tx
+	sql sqlDialect
 }
 
 // New creates a new migration helper for the given sql database
 func New(db *sql.DB) *Migrant {
-	return &Migrant{db}
+	return &Migrant{db: db, sql: getDialect()}
 }
 
-func (migrant *Migrant) initMeta() {
-	migrant.db.Exec("CREATE TABLE migration_meta (id serial primary key, migration text not null unique, migrant_version text not null, updated_at timestamp default current_timestamp);")
+// transaction creates a new transaction
+func (m *Migrant) transaction() error {
+	tx, err := m.db.Begin()
+	m.tx = tx
+	return err
 }
 
-func (migrant *Migrant) setMeta(migrations []string) {
-	for _, m := range migrations {
+// createMeta creates the migration metadata table (if not present)
+func (m *Migrant) createMeta() error {
+	if _, err := m.tx.Exec(m.sql.createMeta()); err != nil {
+		return m.rollback(fmt.Errorf("Migrant - failed creating metadata table: %s", err))
+	}
+	return m.tx.Commit()
+}
 
-		result, err := migrant.db.Exec("INSERT INTO migration_meta(updated_at, migration, migrant_version) VALUES(NOW(), $1, $2);", m, version)
-		if err != nil {
-			log.Printf("DB Err: %s %s", err, result)
+// insertMeta inserts the migration entries into the migration metadata table
+func (m *Migrant) insertMeta(migrations []string) error {
+	for _, migration := range migrations {
+		if _, err := m.tx.Exec(m.sql.insertMeta(), migration, migrantVersion); err != nil {
+			return err
 		}
 	}
+	return nil
 }
 
-func (migrant *Migrant) getMeta() []string {
+// selectMeta selects the migration entries from the migration metadata table
+func (m *Migrant) selectMeta() ([]string, error) {
 	var migrations []string
 
-	rows, err := migrant.db.Query("SELECT migration FROM migration_meta ORDER BY id DESC;")
+	rows, err := m.tx.Query(m.sql.selectMeta())
 	if err != nil {
-		log.Printf("DB Error: %s", err)
-		return migrations
+		return migrations, err
 	}
 
 	defer rows.Close()
 	for rows.Next() {
 		var migration string
-
-		if err := rows.Scan(&migration); err == nil {
-			migrations = append(migrations, migration)
-		} else {
-			log.Printf("DB Error: %s", err)
-			return migrations
+		if err := rows.Scan(&migration); err != nil {
+			return migrations, err
 		}
+		migrations = append(migrations, migration)
 	}
-	return migrations
+
+	return migrations, nil
+}
+
+func (m *Migrant) rollback(err error) error {
+	m.tx.Rollback()
+	log.Println(err)
+	return err
 }
 
 // Migrate executes all the unexecuted sql files (migrations) at the given path
-func (migrant *Migrant) Migrate(path string) error {
-	migrant.initMeta()
-	dir := stripLast(path, '/')
-
-	files, err := filepath.Glob(fmt.Sprintf("%s/*.sql", dir))
-	if err != nil {
-		return err
+func (m *Migrant) Migrate(path string) error {
+	if err := m.transaction(); err == nil {
+		m.createMeta()
 	}
 
-	// Sort the files in alphabetical order (by timestamp)
-	sort.Strings(files)
+	if err := m.transaction(); err == nil {
+		// Get all the migration files
+		files, err := getFiles(path)
+		if err != nil {
+			return m.rollback(fmt.Errorf("Migrant - failed reading migration files: %s", err))
+		}
 
-	migrations := migrant.getMeta()
-	var completed []string
+		// Get the present migration entries
+		migrations, _ := m.selectMeta()
+		var completed []string
+		for _, file := range files {
+			filename := filepath.Base(file)
 
-	for _, file := range files {
-		filename := filepath.Base(file)
+			// If migration has not been executed
+			if !included(filename, migrations) {
 
-		if !contains(filename, migrations) {
-			log.Printf("Migrating: %s", filename)
+				// Read the contents (query) of the migration file
+				query, err := readFile(path, filename)
+				if err != nil {
+					return m.rollback(fmt.Errorf("Migrant - failed reading migration: %s %s", filename, err))
+				}
 
-			if contents, err := ioutil.ReadFile(fmt.Sprintf("%s/%s", dir, filename)); err == nil {
-				if _, err := migrant.db.Exec(string(contents)); err == nil {
-					log.Printf("Migrated: %s", filename)
+				// Execture the migration file
+				log.Printf("Migrant - running migration: %s\n", filename)
+				if _, err := m.tx.Exec(query); err == nil {
+					log.Printf("Migrant - completed migrating: %s\n", filename)
 					completed = append(completed, filename)
 				} else {
-					log.Printf("Could not migrate: %s", err)
-					return err
+					return m.rollback(fmt.Errorf("Migrant - failed migrating: %s %s", filename, err))
 				}
-			} else {
-				log.Printf("Could not migrate: %s", err)
-				return err
-			}
 
-			if len(completed) > 0 {
-				migrant.setMeta(completed)
-				log.Printf("Completed: migrated up to %s\n", completed[len(completed)-1])
-			} else {
-				log.Println("Completed: no new migrations")
 			}
 		}
-	}
 
-	return nil
+		// Update the migration metadata table
+		if len(completed) > 0 {
+			if err := m.insertMeta(completed); err != nil {
+				return m.rollback(fmt.Errorf("Migrant - failed updating migration table: %s", err))
+			}
+		} else {
+			log.Println("Migrant - no new migrations")
+		}
+		return m.tx.Commit()
+	}
+	return fmt.Errorf("Migrant - failed creating migration transaction")
 }
